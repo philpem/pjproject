@@ -2413,34 +2413,53 @@ void pjsua_media_prov_revert(pjsua_call_id call_id)
 }
 
 
-/* Does the remote offer contain a T.38 (image/udptl) media line?
- *
- * pjmedia has no T.38 engine, so an offer whose only media is image/udptl is
- * normally rejected (PJSIP_SC_NOT_ACCEPTABLE_HERE) in channel_init below. An
- * application can, however, terminate T.38 itself on its own UDPTL socket (the
- * way Asterisk's chan_pjsip manages its udptl outside pjmedia) and answer with
- * its own accepting SDP via pjsua_call_answer_with_sdp(). In that case
- * channel_init must proceed and treat the image line as a *disabled* media
- * instead of bailing early: bailing leaves call->audio_idx stale (pointing at
- * the previous audio stream) and the following media update then crashes on an
- * uninitialised sockaddr. Detecting udptl keeps this exception scoped to T.38;
- * ordinary audio/video/text calls are unaffected. */
-static pj_bool_t pjsua_sdp_media_is_udptl(const pjmedia_sdp_media *m)
-{
-    return (m && pj_stricmp2(&m->desc.media, "image") == 0 &&
-            pj_stricmp2(&m->desc.transport, "udptl") == 0);
-}
-
-static pj_bool_t pjsua_sdp_has_udptl(const pjmedia_sdp_session *sdp)
+/* Does the SDP contain at least one media line with a non-zero port, i.e.
+ * media that is not deactivated? This is used to accept an offer whose only
+ * active media is a type pjsua does not manage as a stream (e.g. app-managed
+ * T.38 image/udptl that the application answers itself), instead of rejecting
+ * it as "no media". This keeps the accommodation generic: it is scoped to
+ * "media pjsua does not build a stream for", not to any specific media type.
+ */
+static pj_bool_t sdp_has_active_media(const pjmedia_sdp_session *sdp)
 {
     unsigned i;
+
     if (!sdp)
         return PJ_FALSE;
+
     for (i = 0; i < sdp->media_count; ++i) {
-        if (pjsua_sdp_media_is_udptl(sdp->media[i]))
+        if (sdp->media[i]->desc.port != 0)
             return PJ_TRUE;
     }
     return PJ_FALSE;
+}
+
+
+/* Does media line 'mi' in 'sdp' still point at the transport advertised at
+ * 'tp_addr' (same address and port)? Used to decide whether to keep our media
+ * transport for a slot pjsua no longer builds a stream for: if the (possibly
+ * app-supplied) answer still references our transport, keep it; otherwise it
+ * is orphaned and should be released. The connection address may be at media
+ * or session level (media overrides session, RFC 4566). A non-numeric or
+ * absent address yields PJ_FALSE, i.e. "not ours" -> release, which is the
+ * safe default.
+ */
+static pj_bool_t sdp_media_points_at(const pjmedia_sdp_session *sdp,
+                                     unsigned mi,
+                                     const pj_sockaddr *tp_addr)
+{
+    const pjmedia_sdp_conn *c;
+    pj_sockaddr sdp_addr;
+
+    c = sdp->media[mi]->conn ? sdp->media[mi]->conn : sdp->conn;
+    if (!c)
+        return PJ_FALSE;
+
+    if (pj_sockaddr_parse(pj_AF_UNSPEC(), 0, &c->addr, &sdp_addr) != PJ_SUCCESS)
+        return PJ_FALSE;
+
+    pj_sockaddr_set_port(&sdp_addr, sdp->media[mi]->desc.port);
+    return (pj_sockaddr_cmp(&sdp_addr, tp_addr) == 0);
 }
 
 
@@ -2555,10 +2574,13 @@ pj_status_t pjsua_media_channel_init(pjsua_call_id call_id,
         sort_media(rem_sdp, &STR_TEXT, acc->cfg.use_srtp,
                    mtxtidx, &mtxtcnt, &mtottxtcnt);
 
-        if (maudcnt + mvidcnt + mtxtcnt == 0 && !pjsua_sdp_has_udptl(rem_sdp)) {
-            /* Expecting media in the offer -- unless it is a T.38 image/udptl
-             * offer the application will answer itself; let that through as
-             * disabled media rather than rejecting it. */
+        if (maudcnt + mvidcnt + mtxtcnt == 0 && !sdp_has_active_media(rem_sdp)) {
+            /* Expecting media in the offer -- unless the offer carries active
+             * media that pjsua does not manage as a stream but which the
+             * application will answer itself (e.g. app-managed T.38
+             * image/udptl). Let that through as disabled/app-managed media
+             * rather than rejecting the whole offer.
+             */
             if (sip_err_code)
                 *sip_err_code = PJSIP_SC_NOT_ACCEPTABLE_HERE;
             status = PJSIP_ERRNO_FROM_SIP_STATUS(PJSIP_SC_NOT_ACCEPTABLE_HERE);
@@ -2821,18 +2843,15 @@ pj_status_t pjsua_media_channel_init(pjsua_call_id call_id,
                 pjsua_set_media_tp_state(call_med, PJSUA_MED_TP_DISABLED);
             }
 
-            /* Force a T.38 (image/udptl) line's media type to NONE so the later
-             * media update routes it to the app-managed T.38 branch instead of
-             * the audio path. Otherwise this slot keeps the previous call's
-             * AUDIO type and the update tries to build a fresh audio stream on
-             * the now-addressless image transport, asserting on sa_family. Such
-             * T.38 media is app-managed (the application's own UDPTL socket);
-             * pjsua_media_channel_update() then reports it as disabled media. */
-            if (rem_sdp && mi < rem_sdp->media_count &&
-                pjsua_sdp_media_is_udptl(rem_sdp->media[mi]))
-            {
+            /* A slot that pjsua does not manage as a stream (media_type
+             * UNKNOWN, e.g. app-managed T.38 image/udptl) may still carry a
+             * stale type from a previous negotiation, since the slot is copied
+             * from call->media on re-INVITE. Clear it so the media update does
+             * not try to (re)build an audio/video/text stream on the now
+             * addressless transport and assert on sa_family.
+             */
+            if (media_type == PJMEDIA_TYPE_UNKNOWN)
                 call_med->type = PJMEDIA_TYPE_NONE;
-            }
             /* Put media type just for info if not yet defined */
             else if (call_med->type == PJMEDIA_TYPE_NONE)
                 call_med->type = media_type;
@@ -4638,34 +4657,28 @@ pj_status_t pjsua_media_channel_update(pjsua_call_id call_id,
                                       &need_renego_sdp);
             if (status != PJ_SUCCESS)
                 goto on_check_med_status;
-        } else if (mi < remote_sdp->media_count &&
-                   pjsua_sdp_media_is_udptl(remote_sdp->media[mi]))
-        {
-            /* App-managed T.38 (image/udptl). pjmedia has no T.38 engine;
-             * the application terminates T.38 on its own UDPTL socket (see
-             * the matching note in pjsua_media_channel_init()). There is no
-             * pjsua stream to build, so tear down anything left from the
-             * previous negotiation and mark the slot as disabled media
-             * rather than failing with PJMEDIA_EUNSUPMEDIATYPE. Failing
-             * would expose the slot as PJSUA_CALL_MEDIA_ERROR and, for a
-             * udptl-only offer, leave got_media false so the call is
-             * disconnected during the initial answer.
+        } else if (local_sdp->media[mi]->desc.port != 0) {
+            /* Active media that pjsua does not manage as a stream but which the
+             * (app-supplied) answer keeps open, e.g. app-managed T.38
+             * (image/udptl) that the application terminates on its own socket.
+             * There is no pjsua stream to build: stop any leftover stream,
+             * release our transport unless the negotiated SDP still points at
+             * it (same address and port), and mark the slot as disabled media
+             * -- not error -- so the call is not dropped. Count it as media so
+             * an offer whose only active line is app-managed is still
+             * answerable.
              */
             stop_media_stream(call, mi);
-            if (call_med->tp) {
+            if (call_med->tp &&
+                !sdp_media_points_at(local_sdp, mi, &call_med->rtp_addr))
+            {
                 pjsua_set_media_tp_state(call_med, PJSUA_MED_TP_NULL);
                 pjmedia_transport_close(call_med->tp);
                 call_med->tp = call_med->tp_orig = NULL;
             }
             call_med->state = PJSUA_CALL_MEDIA_NONE;
             call_med->dir = PJMEDIA_DIR_NONE;
-
-            /* Count the app-managed line as media so an initial udptl-only
-             * offer is answerable instead of being rejected as "no media".
-             */
-            if (local_sdp->media[mi]->desc.port != 0)
-                got_media = PJ_TRUE;
-
+            got_media = PJ_TRUE;
             continue;
         } else {
             status = PJMEDIA_EUNSUPMEDIATYPE;
